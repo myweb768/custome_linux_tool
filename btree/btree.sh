@@ -46,6 +46,12 @@ SHOW_ALL=false
 NO_COLOR_FLAG=false
 DIRS_ONLY=false
 DETAILS=false
+MATCH_PATTERN=""
+SHOW_DATE=false
+SORT_BY_TIME=false
+DIRSFIRST=false
+JSON_OUTPUT=false
+GITIGNORE_FLAG=false
 OUTPUT_FILE=""
 TOTAL_DIRS=0
 TOTAL_FILES=0
@@ -60,6 +66,12 @@ show_help() {
     echo "  -a, --all         Show all files (including hidden files like .git, .env)"
     echo "  -d                Show directories only (no files)"
     echo "  -ds               Directories only, with recursive file/size/extension stats"
+    echo "  -P <pattern>      Only show files matching the pattern (e.g. \"*.js\")"
+    echo "  -D                Show last-modified date/time for each item"
+    echo "  -t                Sort by last-modified time instead of name (newest first)"
+    echo "  --dirsfirst       List directories before files"
+    echo "  --gitignore       Ignore whatever the target directory's .gitignore ignores"
+    echo "  -J                Output as JSON instead of a colored tree"
     echo "  -I <pattern>      Ignore files or directories matching the pattern (e.g. node_modules)"
     echo "  -L <level>        Descend only 'level' directories deep"
     echo "  --no-color        Disable colored output"
@@ -72,6 +84,11 @@ show_help() {
     echo "  btree -L 2"
     echo "  btree -d"
     echo "  btree -ds"
+    echo "  btree -P \"*.js\""
+    echo "  btree -D -t"
+    echo "  btree --dirsfirst"
+    echo "  btree --gitignore"
+    echo "  btree -J -o tree.json"
     echo "  btree -o myReport.txt"
     echo "  btree --no-color > tree.txt"
     exit 0
@@ -101,6 +118,30 @@ while [[ $# -gt 0 ]]; do
             DETAILS=true
             shift
             ;;
+        -P)
+            MATCH_PATTERN="$2"
+            shift 2
+            ;;
+        -D)
+            SHOW_DATE=true
+            shift
+            ;;
+        -t)
+            SORT_BY_TIME=true
+            shift
+            ;;
+        --dirsfirst)
+            DIRSFIRST=true
+            shift
+            ;;
+        --gitignore)
+            GITIGNORE_FLAG=true
+            shift
+            ;;
+        -J)
+            JSON_OUTPUT=true
+            shift
+            ;;
         --no-color)
             NO_COLOR_FLAG=true
             shift
@@ -120,6 +161,37 @@ while [[ $# -gt 0 ]]; do
 done
 
 TARGET_DIR="${TARGET_DIR:-.}"
+
+# --gitignore: read the target directory's .gitignore (if present) and
+# fold its patterns into IGNORE_PATTERN, reusing the same filtering
+# path everything else already goes through. This is a reasonable
+# approximation, not a full gitignore implementation: negation rules
+# (lines starting with !) aren't supported, and only the root
+# .gitignore is read (not one per subdirectory, like git itself does).
+if [ "$GITIGNORE_FLAG" = true ] && [ -f "$TARGET_DIR/.gitignore" ]; then
+    gi_pattern=""
+    while IFS= read -r line; do
+        line="${line%%$'\r'}"
+        [[ -z "$line" || "$line" == \#* || "$line" == !* ]] && continue
+        clean="${line#/}"
+        clean="${clean%/}"
+        [ -z "$clean" ] && continue
+        esc=$(printf '%s' "$clean" | sed -e 's/[.[\^$()+?{}|]/\\&/g' -e 's/\*/.*/g')
+        if [ -z "$gi_pattern" ]; then
+            gi_pattern="$esc"
+        else
+            gi_pattern="${gi_pattern}|${esc}"
+        fi
+    done < "$TARGET_DIR/.gitignore"
+
+    if [ -n "$gi_pattern" ]; then
+        if [ -n "$IGNORE_PATTERN" ]; then
+            IGNORE_PATTERN="${IGNORE_PATTERN}|${gi_pattern}"
+        else
+            IGNORE_PATTERN="$gi_pattern"
+        fi
+    fi
+fi
 
 # If -o was given, send all tree output to that file instead of the
 # terminal. This happens *before* the terminal check below, so writing
@@ -238,6 +310,67 @@ compute_dir_stats() {
     fi
 }
 
+# Builds the filtered, sorted list of entries to show for one directory,
+# applying -a, -I/--gitignore, -d, -P, and --dirsfirst consistently.
+# Bash can't return arrays, so the result goes into the global
+# VISIBLE_RESULT array instead - both the text tree and the JSON tree
+# call this, so filtering only has one implementation to keep correct.
+get_visible_entries() {
+    local dir="$1"
+    local entries=()
+
+    if [ "$SORT_BY_TIME" = true ]; then
+        if [ "$SHOW_ALL" = true ]; then
+            while IFS= read -r line; do entries+=("$line"); done < <(ls -A1 -t "$dir" 2>/dev/null)
+        else
+            while IFS= read -r line; do entries+=("$line"); done < <(ls -1 -t "$dir" 2>/dev/null)
+        fi
+    else
+        if [ "$SHOW_ALL" = true ]; then
+            while IFS= read -r line; do entries+=("$line"); done < <(ls -A1 "$dir" 2>/dev/null | sort)
+        else
+            while IFS= read -r line; do entries+=("$line"); done < <(ls -1 "$dir" 2>/dev/null | sort)
+        fi
+    fi
+
+    # Apply the ignore pattern, -d, and -P up front, before figuring out
+    # which item is "last" - otherwise a filtered trailing item makes
+    # the connector land on the wrong line (└── vs ├──).
+    VISIBLE_RESULT=()
+    for item in "${entries[@]}"; do
+        if [ -n "$IGNORE_PATTERN" ] && [[ "$item" =~ $IGNORE_PATTERN ]]; then
+            continue
+        fi
+        if [ "$DIRS_ONLY" = true ] && [ ! -d "$dir/$item" ]; then
+            continue
+        fi
+        if [ -n "$MATCH_PATTERN" ] && [ -f "$dir/$item" ]; then
+            case "$item" in
+                $MATCH_PATTERN) ;;
+                *) continue ;;
+            esac
+        fi
+        VISIBLE_RESULT+=("$item")
+    done
+
+    if [ "$DIRSFIRST" = true ]; then
+        local dirs_arr=() files_arr=()
+        for item in "${VISIBLE_RESULT[@]}"; do
+            if [ -d "$dir/$item" ]; then
+                dirs_arr+=("$item")
+            else
+                files_arr+=("$item")
+            fi
+        done
+        VISIBLE_RESULT=("${dirs_arr[@]}" "${files_arr[@]}")
+    fi
+}
+
+# For -D: last-modified date/time of a file or directory.
+get_mtime() {
+    date -r "$1" "+%Y-%m-%d %H:%M" 2>/dev/null
+}
+
 # Function to print directory recursively
 walk_dir() {
     local dir="$1"
@@ -248,31 +381,8 @@ walk_dir() {
         return
     fi
 
-    local entries=()
-
-    if [ "$SHOW_ALL" = true ]; then
-        while IFS= read -r line; do
-            entries+=("$line")
-        done < <(ls -A1 "$dir" 2>/dev/null | sort)
-    else
-        while IFS= read -r line; do
-            entries+=("$line")
-        done < <(ls -1 "$dir" 2>/dev/null | sort)
-    fi
-
-    # Apply the ignore pattern and (if -d) drop files up front, before
-    # figuring out which item is "last" - otherwise an ignored/filtered
-    # trailing item makes the connector land on the wrong line (└── vs ├──).
-    local visible=()
-    for item in "${entries[@]}"; do
-        if [ -n "$IGNORE_PATTERN" ] && [[ "$item" =~ $IGNORE_PATTERN ]]; then
-            continue
-        fi
-        if [ "$DIRS_ONLY" = true ] && [ ! -d "$dir/$item" ]; then
-            continue
-        fi
-        visible+=("$item")
-    done
+    get_visible_entries "$dir"
+    local visible=("${VISIBLE_RESULT[@]}")
 
     local count=${#visible[@]}
     local i=0
@@ -289,14 +399,19 @@ walk_dir() {
             ext_prefix="    "
         fi
 
+        local date_str=""
+        if [ "$SHOW_DATE" = true ]; then
+            date_str=" ${COLOR_STATS}[$(get_mtime "$full_path")]${COLOR_RESET}"
+        fi
+
         if [ -d "$full_path" ]; then
             TOTAL_DIRS=$((TOTAL_DIRS + 1))
             if [ "$DETAILS" = true ]; then
                 local dstats
                 dstats=$(compute_dir_stats "$full_path")
-                echo -e "${prefix}${pointer}${COLOR_SUB_DIR}${item}/${COLOR_RESET} ${COLOR_STATS}(${dstats})${COLOR_RESET}"
+                echo -e "${prefix}${pointer}${COLOR_SUB_DIR}${item}/${COLOR_RESET} ${COLOR_STATS}(${dstats})${COLOR_RESET}${date_str}"
             else
-                echo -e "${prefix}${pointer}${COLOR_SUB_DIR}${item}/${COLOR_RESET}"
+                echo -e "${prefix}${pointer}${COLOR_SUB_DIR}${item}/${COLOR_RESET}${date_str}"
             fi
             walk_dir "$full_path" "${prefix}${ext_prefix}" "$((depth + 1))"
         elif [ -f "$full_path" ]; then
@@ -317,20 +432,95 @@ walk_dir() {
 
             local file_color=$(get_file_color "$item")
 
-            echo -e "${prefix}${pointer}${file_color}${item}${COLOR_RESET} ${COLOR_STATS}(${size:-0B}, ${chars}ch, ${words}w)${COLOR_RESET}"
+            echo -e "${prefix}${pointer}${file_color}${item}${COLOR_RESET} ${COLOR_STATS}(${size:-0B}, ${chars}ch, ${words}w)${COLOR_RESET}${date_str}"
         fi
     done
 }
 
-# Main Root Directory Name
-echo -e "${COLOR_MAIN_DIR}${TARGET_DIR}${COLOR_RESET}"
-walk_dir "$TARGET_DIR" "" 1
+# For -J: escapes a string for safe use inside a JSON string value.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
 
-echo ""
-if [ "$DIRS_ONLY" = true ]; then
-    echo -e "${COLOR_STATS}${TOTAL_DIRS} directories${COLOR_RESET}"
+# For -J: same filtering/traversal as walk_dir, but emits JSON instead
+# of a colored tree. Uses the same get_visible_entries() as walk_dir,
+# so -a/-I/--gitignore/-d/-P/--dirsfirst all behave identically in
+# either output mode.
+walk_dir_json() {
+    local dir="$1"
+    local depth="$2"
+    local indent="$3"
+
+    if [ "$depth" -gt "$MAX_DEPTH" ]; then
+        printf '[]'
+        return
+    fi
+
+    get_visible_entries "$dir"
+    local visible=("${VISIBLE_RESULT[@]}")
+    local count=${#visible[@]}
+
+    if [ "$count" -eq 0 ]; then
+        printf '[]'
+        return
+    fi
+
+    echo "["
+    local i=0
+    for item in "${visible[@]}"; do
+        i=$((i + 1))
+        local full_path="$dir/$item"
+        local esc_name
+        esc_name=$(json_escape "$item")
+        local comma=","
+        [ "$i" -eq "$count" ] && comma=""
+
+        if [ -d "$full_path" ]; then
+            TOTAL_DIRS=$((TOTAL_DIRS + 1))
+            printf '%s  {\n' "$indent"
+            printf '%s    "type": "directory",\n' "$indent"
+            printf '%s    "name": "%s",\n' "$indent" "$esc_name"
+            printf '%s    "contents": ' "$indent"
+            walk_dir_json "$full_path" "$((depth + 1))" "${indent}    "
+            printf '\n%s  }%s\n' "$indent" "$comma"
+        elif [ -f "$full_path" ]; then
+            TOTAL_FILES=$((TOTAL_FILES + 1))
+            local size
+            size=$(stat -c%s "$full_path" 2>/dev/null)
+            printf '%s  {\n' "$indent"
+            printf '%s    "type": "file",\n' "$indent"
+            printf '%s    "name": "%s",\n' "$indent" "$esc_name"
+            printf '%s    "size": %s\n' "$indent" "${size:-0}"
+            printf '%s  }%s\n' "$indent" "$comma"
+        fi
+    done
+    printf '%s]' "$indent"
+}
+
+# Main Root Directory Name
+if [ "$JSON_OUTPUT" = true ]; then
+    esc_root=$(json_escape "$TARGET_DIR")
+    echo "{"
+    echo "  \"type\": \"directory\","
+    echo "  \"name\": \"${esc_root}\","
+    printf '  "contents": '
+    walk_dir_json "$TARGET_DIR" 1 "  "
+    echo ""
+    echo "}"
+    echo "✓ ${TOTAL_DIRS} directories, ${TOTAL_FILES} files" >&2
 else
-    echo -e "${COLOR_STATS}${TOTAL_DIRS} directories, ${TOTAL_FILES} files${COLOR_RESET}"
+    echo -e "${COLOR_MAIN_DIR}${TARGET_DIR}${COLOR_RESET}"
+    walk_dir "$TARGET_DIR" "" 1
+
+    echo ""
+    if [ "$DIRS_ONLY" = true ]; then
+        echo -e "${COLOR_STATS}${TOTAL_DIRS} directories${COLOR_RESET}"
+    else
+        echo -e "${COLOR_STATS}${TOTAL_DIRS} directories, ${TOTAL_FILES} files${COLOR_RESET}"
+    fi
 fi
 
 if [ -n "$OUTPUT_FILE" ]; then
