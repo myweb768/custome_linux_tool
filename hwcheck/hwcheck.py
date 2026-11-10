@@ -513,7 +513,13 @@ def collect_disks():
                     elif "GB" in name.upper():
                         info["written_bytes"] = raw * 1e9
                     else:
-                        info["written_bytes"] = raw * 512
+                        guess = raw * 512
+                        # Some vendors (e.g. cheap SATA SSDs) do not count 512-byte LBAs here.
+                        # If that reading says "less than one full disk written" although the drive
+                        # is clearly worn, assume 32 MiB units instead (marked as estimated).
+                        if guess < info["size_gb"] * 1e9 and (info["wear_used"] or 0) >= 5:
+                            guess = raw * 32 * 1024**2
+                        info["written_bytes"] = guess
         info["bad_sectors"] = info["reallocated"] + info["pending"] + info["uncorrectable"]
         disks.append(info)
     return disks
