@@ -33,8 +33,8 @@ It runs as a modern terminal UI (TUI) or as a plain text report.
 ## Installation
 
 ```bash
-git clone <your-repo-url>
-cd <repo-folder>/hwcheck
+git clone https://github.com/myweb768/custome_linux_tool.git
+cd custome_linux_tool/hwcheck
 bash setup.sh
 ```
 
